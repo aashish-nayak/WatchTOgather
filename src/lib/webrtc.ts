@@ -20,7 +20,7 @@ export class WebRTCManager {
   async startScreenShare(): Promise<MediaStream> {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { mediaSource: 'screen' },
+        video: true,
         audio: true,
       });
 

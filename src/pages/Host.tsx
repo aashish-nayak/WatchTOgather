@@ -8,7 +8,7 @@ import { Monitor, MonitorOff, Copy, Users, ArrowLeft } from 'lucide-react';
 import Chat, { ChatMessage } from '@/components/Chat';
 import VideoPlayer from '@/components/VideoPlayer';
 import { WebRTCManager } from '@/lib/webrtc';
-import { SignalingService, generatePeerId } from '@/lib/signaling';
+import { signalingService, generatePeerId } from '@/lib/signaling';
 
 export default function Host() {
   const { roomId } = useParams<{ roomId: string }>();
@@ -18,7 +18,7 @@ export default function Host() {
   const [viewerCount, setViewerCount] = useState(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [webrtcManager] = useState(() => new WebRTCManager());
-  const [signalingService] = useState(() => new SignalingService(roomId!, generatePeerId()));
+  const [peerId] = useState(() => generatePeerId());
   const [connectedPeers, setConnectedPeers] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -27,9 +27,12 @@ export default function Host() {
       return;
     }
 
+    // Create room
+    signalingService.createRoom(roomId, peerId);
+
     // Setup signaling handlers
-    signalingService.onMessage('join', async (message) => {
-      console.log('Viewer joined:', message.peerId);
+    const handleJoin = async (message: any) => {
+      console.log('Viewer joined:', message.userId);
       
       if (!isSharing) {
         toast.error('Please start screen sharing first');
@@ -39,22 +42,19 @@ export default function Host() {
       try {
         // Create peer connection for new viewer
         const peerConnection = webrtcManager.createHostConnection(
-          message.peerId,
+          message.userId,
           (candidate) => {
-            signalingService.sendMessage('ice-candidate', {
-              target: message.peerId,
-              candidate,
-            });
+            signalingService.sendIceCandidate(roomId, message.userId, candidate);
           },
           (state) => {
-            console.log(`Connection state for ${message.peerId}:`, state);
+            console.log(`Connection state for ${message.userId}:`, state);
             if (state === 'connected') {
-              setConnectedPeers((prev) => new Set(prev).add(message.peerId));
+              setConnectedPeers((prev) => new Set(prev).add(message.userId));
               setViewerCount((prev) => prev + 1);
             } else if (state === 'disconnected' || state === 'failed') {
               setConnectedPeers((prev) => {
                 const newSet = new Set(prev);
-                newSet.delete(message.peerId);
+                newSet.delete(message.userId);
                 return newSet;
               });
               setViewerCount((prev) => Math.max(0, prev - 1));
@@ -63,7 +63,7 @@ export default function Host() {
         );
 
         // Setup data channel for chat
-        const dataChannel = webrtcManager.getDataChannel(message.peerId);
+        const dataChannel = webrtcManager.getDataChannel(message.userId);
         if (dataChannel) {
           dataChannel.onmessage = (event) => {
             const chatMessage: ChatMessage = JSON.parse(event.data);
@@ -72,58 +72,64 @@ export default function Host() {
         }
 
         // Create and send offer
-        const offer = await webrtcManager.createOffer(message.peerId);
-        signalingService.sendMessage('offer', {
-          target: message.peerId,
-          offer,
-        });
+        const offer = await webrtcManager.createOffer(message.userId);
+        signalingService.sendOffer(roomId, message.userId, offer);
       } catch (error) {
         console.error('Error handling viewer join:', error);
         toast.error('Failed to connect to viewer');
       }
-    });
+    };
 
-    signalingService.onMessage('answer', async (message) => {
-      if (message.data.target === signalingService['peerId']) {
+    const handleAnswer = async (message: any) => {
+      if (message.targetId === peerId) {
         try {
           await webrtcManager.setRemoteDescription(
-            message.peerId,
-            message.data.answer
+            message.fromId,
+            message.data
           );
         } catch (error) {
           console.error('Error setting remote description:', error);
         }
       }
-    });
+    };
 
-    signalingService.onMessage('ice-candidate', async (message) => {
-      if (message.data.target === signalingService['peerId']) {
+    const handleIceCandidate = async (message: any) => {
+      if (message.targetId === peerId) {
         try {
           await webrtcManager.addIceCandidate(
-            message.peerId,
-            message.data.candidate
+            message.fromId,
+            message.data
           );
         } catch (error) {
           console.error('Error adding ICE candidate:', error);
         }
       }
-    });
+    };
 
-    signalingService.onMessage('leave', (message) => {
-      webrtcManager.closePeerConnection(message.peerId);
+    const handleLeave = (message: any) => {
+      webrtcManager.closePeerConnection(message.userId);
       setConnectedPeers((prev) => {
         const newSet = new Set(prev);
-        newSet.delete(message.peerId);
+        newSet.delete(message.userId);
         return newSet;
       });
       setViewerCount((prev) => Math.max(0, prev - 1));
-    });
+    };
+
+    signalingService.on('viewer-joined', handleJoin);
+    signalingService.on('answer', handleAnswer);
+    signalingService.on('ice-candidate', handleIceCandidate);
+    signalingService.on('viewer-left', handleLeave);
 
     return () => {
       webrtcManager.closeAllConnections();
-      signalingService.cleanup();
+      signalingService.leaveRoom(roomId);
+      signalingService.off('viewer-joined', handleJoin);
+      signalingService.off('answer', handleAnswer);
+      signalingService.off('ice-candidate', handleIceCandidate);
+      signalingService.off('viewer-left', handleLeave);
     };
-  }, [roomId, navigate, signalingService, webrtcManager, isSharing]);
+  }, [roomId, navigate, peerId, webrtcManager, isSharing]);
 
   const handleStartSharing = async () => {
     try {

@@ -8,7 +8,7 @@ import { ArrowLeft, Wifi, WifiOff } from 'lucide-react';
 import Chat, { ChatMessage } from '@/components/Chat';
 import VideoPlayer from '@/components/VideoPlayer';
 import { WebRTCManager } from '@/lib/webrtc';
-import { SignalingService, generatePeerId } from '@/lib/signaling';
+import { signalingService, generatePeerId } from '@/lib/signaling';
 
 export default function Viewer() {
   const { roomId } = useParams<{ roomId: string }>();
@@ -18,7 +18,7 @@ export default function Viewer() {
   const [isConnecting, setIsConnecting] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [webrtcManager] = useState(() => new WebRTCManager());
-  const [signalingService] = useState(() => new SignalingService(roomId!, generatePeerId()));
+  const [peerId] = useState(() => generatePeerId());
   const [dataChannel, setDataChannel] = useState<RTCDataChannel | null>(null);
   const [hostPeerId, setHostPeerId] = useState<string | null>(null);
 
@@ -28,16 +28,19 @@ export default function Viewer() {
       return;
     }
 
+    // Join room
+    signalingService.joinRoom(roomId, peerId);
+
     // Setup signaling handlers
-    signalingService.onMessage('offer', async (message) => {
-      if (message.data.target === signalingService['peerId']) {
-        console.log('Received offer from host:', message.peerId);
-        setHostPeerId(message.peerId);
+    const handleOffer = async (message: any) => {
+      if (message.targetId === peerId) {
+        console.log('Received offer from host:', message.fromId);
+        setHostPeerId(message.fromId);
 
         try {
           // Create peer connection for viewer
           const peerConnection = webrtcManager.createViewerConnection(
-            message.peerId,
+            message.fromId,
             (stream) => {
               console.log('Received remote stream');
               setRemoteStream(stream);
@@ -54,10 +57,7 @@ export default function Viewer() {
               };
             },
             (candidate) => {
-              signalingService.sendMessage('ice-candidate', {
-                target: message.peerId,
-                candidate,
-              });
+              signalingService.sendIceCandidate(roomId, message.fromId, candidate);
             },
             (state) => {
               console.log('Connection state:', state);
@@ -73,44 +73,51 @@ export default function Viewer() {
 
           // Set remote description and create answer
           await webrtcManager.setRemoteDescription(
-            message.peerId,
-            message.data.offer
+            message.fromId,
+            message.data
           );
-          const answer = await webrtcManager.createAnswer(message.peerId);
+          const answer = await webrtcManager.createAnswer(message.fromId);
           
-          signalingService.sendMessage('answer', {
-            target: message.peerId,
-            answer,
-          });
+          signalingService.sendAnswer(roomId, message.fromId, answer);
         } catch (error) {
           console.error('Error handling offer:', error);
           setIsConnecting(false);
           toast.error('Failed to connect to host');
         }
       }
-    });
+    };
 
-    signalingService.onMessage('ice-candidate', async (message) => {
-      if (message.data.target === signalingService['peerId']) {
+    const handleIceCandidate = async (message: any) => {
+      if (message.targetId === peerId) {
         try {
           await webrtcManager.addIceCandidate(
-            message.peerId,
-            message.data.candidate
+            message.fromId,
+            message.data
           );
         } catch (error) {
           console.error('Error adding ICE candidate:', error);
         }
       }
-    });
+    };
 
-    // Announce presence to host
-    signalingService.sendMessage('join');
+    const handleHostLeft = () => {
+      setIsConnected(false);
+      setRemoteStream(null);
+      toast.error('Host has left the room');
+    };
+
+    signalingService.on('offer', handleOffer);
+    signalingService.on('ice-candidate', handleIceCandidate);
+    signalingService.on('host-left', handleHostLeft);
 
     return () => {
       webrtcManager.closeAllConnections();
-      signalingService.cleanup();
+      signalingService.leaveRoom(roomId);
+      signalingService.off('offer', handleOffer);
+      signalingService.off('ice-candidate', handleIceCandidate);
+      signalingService.off('host-left', handleHostLeft);
     };
-  }, [roomId, navigate, signalingService, webrtcManager]);
+  }, [roomId, navigate, peerId, webrtcManager]);
 
   const handleSendMessage = useCallback((text: string) => {
     const message: ChatMessage = {
