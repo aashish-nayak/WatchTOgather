@@ -1,19 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// signaling-service.ts
-// Robust, queue-based WebSocket signaling service for WebRTC
-// Usage:
-// 1) import { signalingService, generatePeerId, generateRoomId } from './signaling-service';
-// 2) signalingService.start(); // optionally pass autoConnect = true
-// 3) signalingService.on('*', (msg) => { ... })
-// 4) signalingService.joinRoom(roomId, userId);
-
-const WS_URL = (import.meta.env?.VITE_WS_URL as string) || (window as any)?.__WS_URL__ || 'ws://localhost:8080';
+// Fixed signaling service with proper initialization
+const WS_URL = (import.meta.env?.VITE_WS_URL as string) || (window as any)?.__WS_URL__ || 'ws://localhost:5000'; // Changed from 8080 to 5000
 
 export type SignalingMessage = {
-  type: string; // 'offer'|'answer'|'ice-candidate'|'create-room'|'join-room'|'leave-room'|'chat-message' etc
+  type: string;
   roomId?: string;
   userId?: string;
   targetId?: string;
+  fromId?: string; // Added missing fromId
   data?: any;
   text?: string;
   username?: string;
@@ -28,37 +22,52 @@ class SignalingService {
   private callbacks: Map<string, SignalingCallback[]> = new Map();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
-  private baseReconnectDelay = 1000; // ms
+  private baseReconnectDelay = 1000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
   private currentRoomId: string | null = null;
   private currentUserId: string | null = null;
   private currentRole: 'host' | 'viewer' | null = null;
   private autoReconnect = true;
-  private heartbeatIntervalMs = 25000; // send ping every 25s
+  private heartbeatIntervalMs = 25000;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private isStarted = false;
 
   constructor() {
-    // Do not auto-connect in constructor by default. Call start() to begin.
+    // Do not auto-connect in constructor
   }
 
-  /** Start the service and optionally auto-connect */
   public start(autoConnect = true) {
+    if (this.isStarted) {
+      console.warn('Signaling service already started');
+      return;
+    }
+    
+    this.isStarted = true;
     this.autoReconnect = true;
     this.intentionallyClosed = false;
-    if (autoConnect) this.connect();
+    
+    if (autoConnect) {
+      this.connect();
+    }
   }
 
-  /** Stop completely (no reconnects) */
   public stop() {
+    this.isStarted = false;
     this.autoReconnect = false;
     this.intentionallyClosed = true;
     this.clearReconnectTimer();
     this.clearHeartbeat();
+    
     if (this.ws) {
-      try { this.ws.close(); } catch (e) { /* ignore */ }
+      try { 
+        this.ws.close(); 
+      } catch (e) { 
+        console.warn('Error closing WebSocket:', e);
+      }
       this.ws = null;
     }
+    
     this.sendQueue = [];
     this.callbacks.clear();
     this.currentRoomId = null;
@@ -67,9 +76,8 @@ class SignalingService {
   }
 
   private connect() {
-    // Prevent creating multiple sockets if one is CONNECTING or OPEN
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      console.debug('WebSocket already connecting/open; skipping new connect');
+      console.debug('WebSocket already connecting/open');
       return;
     }
 
@@ -80,34 +88,33 @@ class SignalingService {
 
       this.ws.onopen = this.handleOpen.bind(this);
       this.ws.onmessage = this.handleMessage.bind(this);
-      this.ws.onclose = (ev) => {
-        console.warn('WS onclose', ev.code, ev.reason, 'wasClean', ev.wasClean);
-        this.handleClose(ev);
-      };
-      this.ws.onerror = (err) => {
-        console.error('WS onerror', err);
-        this.handleError(err);
-      };
+      this.ws.onclose = this.handleClose.bind(this);
+      this.ws.onerror = this.handleError.bind(this);
     } catch (err) {
       console.error('Failed to create WebSocket:', err);
       this.scheduleReconnect();
     }
   }
 
-  private handleOpen(ev: Event) {
-    console.info('WebSocket open');
+  private handleOpen(_ev: Event) {
+    console.info('WebSocket connected successfully');
     this.reconnectAttempts = 0;
 
     // Flush queue
     while (this.sendQueue.length > 0 && this.ws && this.ws.readyState === WebSocket.OPEN) {
       const payload = this.sendQueue.shift()!;
-      try { this.ws.send(payload); } catch (e) { console.warn('Failed to flush queued message', e); this.sendQueue.unshift(payload); break; }
+      try { 
+        this.ws.send(payload); 
+      } catch (e) { 
+        console.warn('Failed to flush queued message', e); 
+        this.sendQueue.unshift(payload); 
+        break; 
+      }
     }
 
-    // Start heartbeat/ping
     this.startHeartbeat();
 
-    // If we were in a room before reconnect, rejoin/recreate
+    // Rejoin room if needed
     if (this.currentRoomId && this.currentUserId && this.currentRole) {
       console.info('Rejoining room after reconnect', this.currentRoomId, this.currentRole);
       if (this.currentRole === 'host') {
@@ -120,12 +127,12 @@ class SignalingService {
 
   private handleMessage(ev: MessageEvent) {
     try {
-      const data = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
-      // If server sends plain strings, attempt JSON parse safely
-      const message: SignalingMessage = (typeof data === 'string') ? JSON.parse(data) : data;
-      console.debug('Received signaling message:', message.type, message);
+      const data = typeof ev.data === 'string' ? ev.data : String(ev.data);
+      const message: SignalingMessage = JSON.parse(data);
+      
+      console.debug('Received:', message.type, message);
 
-      // Call exact-type callbacks
+      // Call type-specific callbacks
       const list = this.callbacks.get(message.type ?? '') || [];
       list.forEach(cb => safeCall(cb, message));
 
@@ -133,27 +140,26 @@ class SignalingService {
       const wildcard = this.callbacks.get('*') || [];
       wildcard.forEach(cb => safeCall(cb, message));
     } catch (err) {
-      console.error('Error parsing or dispatching message', err, ev.data);
+      console.error('Error parsing message:', err, ev.data);
     }
   }
 
   private handleClose(ev: CloseEvent) {
-    console.warn('WebSocket closed', ev.code, ev.reason, 'clean=', ev.wasClean);
+    console.warn('WebSocket closed:', ev.code, ev.reason);
     this.ws = null;
     this.clearHeartbeat();
 
-    if (!this.intentionallyClosed && this.autoReconnect) {
+    if (!this.intentionallyClosed && this.autoReconnect && this.isStarted) {
       this.scheduleReconnect();
     }
   }
 
   private handleError(ev: Event | any) {
-    console.error('WebSocket error', ev);
-    // Error events are followed by close usually; don't aggressively reconnect here.
+    console.error('WebSocket error:', ev);
   }
 
   private scheduleReconnect() {
-    if (!this.autoReconnect) return;
+    if (!this.autoReconnect || !this.isStarted) return;
 
     this.reconnectAttempts++;
     if (this.reconnectAttempts > this.maxReconnectAttempts) {
@@ -162,7 +168,8 @@ class SignalingService {
     }
 
     const delay = this.baseReconnectDelay * Math.min(30, this.reconnectAttempts);
-    console.info(`Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    console.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    
     this.clearReconnectTimer();
     this.reconnectTimer = setTimeout(() => {
       this.connect();
@@ -178,14 +185,15 @@ class SignalingService {
 
   private startHeartbeat() {
     this.clearHeartbeat();
-    try {
-      this.heartbeatTimer = setInterval(() => {
-        // lightweight ping - a minimal JSON we expect server to ignore or respond
-        this.safeSend({ type: 'ping', ts: Date.now() }).catch(() => { /* no-op */ });
-      }, this.heartbeatIntervalMs);
-    } catch (e) {
-      // ignore
-    }
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+        } catch (e) {
+          console.warn('Heartbeat failed:', e);
+        }
+      }
+    }, this.heartbeatIntervalMs);
   }
 
   private clearHeartbeat() {
@@ -195,43 +203,44 @@ class SignalingService {
     }
   }
 
-  /** Queue-aware safe send. Returns a promise that resolves when message is sent (or queued). */
-  public safeSend(message: SignalingMessage, timeoutMs = 5000): Promise<void> {
+  public safeSend(message: SignalingMessage): Promise<void> {
     const payload = JSON.stringify(message);
 
-    return new Promise((resolve, reject) => {
-      // If ws open send immediately
+    return new Promise((resolve) => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try { this.ws.send(payload); resolve(); } catch (err) { console.error('send failed', err); this.sendQueue.push(payload); resolve(); }
+        try { 
+          this.ws.send(payload); 
+          resolve(); 
+        } catch (err) { 
+          console.error('Send failed:', err); 
+          this.sendQueue.push(payload); 
+          resolve(); 
+        }
         return;
       }
 
-      // If connecting, queue
       if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
-        console.debug('WebSocket CONNECTING - queueing message:', message.type);
+        console.debug('Queueing message (connecting):', message.type);
         this.sendQueue.push(payload);
         resolve();
         return;
       }
 
-      // If no ws or closed, queue and attempt to connect
-      console.debug('WebSocket not open - queueing and attempting to (re)connect');
+      console.debug('Queueing message (no connection):', message.type);
       this.sendQueue.push(payload);
       this.connect();
       resolve();
-
-      // Note: we do not reject on timeout; caller can choose to await confirmation via other signaling flow.
     });
   }
 
-  // Helper that logs before sending; keeps API parity with previous implementation
   private send(message: SignalingMessage) {
     this.safeSend(message).catch(() => { /* ignore */ });
   }
 
-  // Public API: event listeners
   public on(type: string, cb: SignalingCallback) {
-    if (!this.callbacks.has(type)) this.callbacks.set(type, []);
+    if (!this.callbacks.has(type)) {
+      this.callbacks.set(type, []);
+    }
     this.callbacks.get(type)!.push(cb);
   }
 
@@ -242,7 +251,6 @@ class SignalingService {
     if (idx >= 0) arr.splice(idx, 1);
   }
 
-  // Convenience methods for signaling actions
   public createRoom(roomId: string, userId: string) {
     this.currentRoomId = roomId;
     this.currentUserId = userId;
@@ -282,11 +290,28 @@ class SignalingService {
     this.send({ type: 'chat-message', roomId, userId, username, text });
   }
 
-  public isConnected() { return this.ws?.readyState === WebSocket.OPEN; }
+  public isConnected() { 
+    return this.ws?.readyState === WebSocket.OPEN; 
+  }
+
+  public getConnectionState() {
+    if (!this.ws) return 'closed';
+    switch (this.ws.readyState) {
+      case WebSocket.CONNECTING: return 'connecting';
+      case WebSocket.OPEN: return 'open';
+      case WebSocket.CLOSING: return 'closing';
+      case WebSocket.CLOSED: return 'closed';
+      default: return 'unknown';
+    }
+  }
 }
 
 function safeCall(cb: SignalingCallback, message: SignalingMessage) {
-  try { cb(message); } catch (err) { console.error('Signaling callback error', err); }
+  try { 
+    cb(message); 
+  } catch (err) { 
+    console.error('Callback error:', err); 
+  }
 }
 
 export const signalingService = new SignalingService();
