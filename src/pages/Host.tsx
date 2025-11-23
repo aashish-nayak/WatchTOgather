@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
@@ -31,6 +32,7 @@ export default function Host() {
     signalingService.createRoom(roomId, peerId);
 
     // Setup signaling handlers
+     
     const handleJoin = async (message: any) => {
       console.log('Viewer joined:', message.userId);
       
@@ -133,7 +135,20 @@ export default function Host() {
 
   const handleStartSharing = async () => {
     try {
-      const stream = await webrtcManager.startScreenShare();
+      let stream;
+      try {
+        stream = await webrtcManager.startScreenShare(); // try with audio
+      } catch (err) {
+        console.warn('Display + audio failed, retrying without audio', err);
+        // Try again without audio because some browsers block audio for display media
+        try {
+          // Direct capture: navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+          stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        } catch (err2) {
+          console.error('Failed to start screen share even without audio', err2);
+          throw err2;
+        }
+      }
       setLocalStream(stream);
       setIsSharing(true);
       toast.success('Screen sharing started');
